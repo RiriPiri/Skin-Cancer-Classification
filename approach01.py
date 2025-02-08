@@ -1,134 +1,135 @@
+import os
+import cv2
 import torch
+import numpy as np
 import torch.nn as nn
 import torch.optim as optim
 import torchvision.transforms as transforms
-import torchvision.datasets as datasets
 from torch.utils.data import DataLoader, Dataset
-import cv2
-import numpy as np
-import os
-import matplotlib.pyplot as plt
-from skimage.filters import frangi
+from sklearn.model_selection import train_test_split
 from PIL import Image
 
-# -------------------------------
-# 1️⃣ Load and Preprocess Images
-# -------------------------------
-
-class SkinLesionDataset(Dataset):
-    def __init__(self, img_dir, transform=None):
-        self.img_dir = img_dir
+# Custom Dataset for loading images and precomputed vessel images
+class SkinCancerDataset(Dataset):
+    def __init__(self, image_paths, vessel_paths, labels, transform=None):
+        self.image_paths = image_paths
+        self.vessel_paths = vessel_paths
+        self.labels = labels
         self.transform = transform
-        self.image_files = [f for f in os.listdir(img_dir) if f.endswith('.jpg') or f.endswith('.png')]
-        self.labels = [self.get_label(f) for f in self.image_files]  # Extract labels from filenames
-
-    def get_label(self, filename):
-        # Example: "melanoma_001.jpg" -> Label = "melanoma"
-        return filename.split("_")[0]
-
-    def frangi_filter(self, image):
-        # Convert to grayscale
-        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-        # Apply Frangi vessel enhancement filter
-        vessels = frangi(gray)
-        # Normalize to 0-255
-        vessels = (255 * (vessels - vessels.min()) / (vessels.max() - vessels.min())).astype(np.uint8)
-        return vessels
 
     def __len__(self):
-        return len(self.image_files)
+        return len(self.image_paths)
 
     def __getitem__(self, idx):
-        img_path = os.path.join(self.img_dir, self.image_files[idx])
+        img_path = self.image_paths[idx]
+        vessel_path = self.vessel_paths[idx]
+        label = self.labels[idx]
+
+        # Load original image
         image = cv2.imread(img_path)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
-        # Apply Frangi filter
-        vessels = self.frangi_filter(image)
-
-        # Convert images to PIL format for transformation
         image = Image.fromarray(image)
-        vessels = Image.fromarray(vessels)
+
+        # Load vessel image (already precomputed)
+        vessels = cv2.imread(vessel_path, cv2.IMREAD_GRAYSCALE)
+        vessels = Image.fromarray(vessels).convert("RGB")  # Convert grayscale to 3-channel
 
         if self.transform:
             image = self.transform(image)
             vessels = self.transform(vessels)
 
-        return torch.cat((image, vessels), dim=0), self.labels[idx]  # Stack original + vessel image
+        # Concatenate original image and vessel image along the channel dimension
+        combined_input = torch.cat((image, vessels), dim=0)  # Shape: (6, 224, 224)
 
-# -------------------------------
-# 2️⃣ Define CNN Model
-# -------------------------------
+        return combined_input, label
 
-class CNN_Model(nn.Module):
+# CNN Model
+class SkinCancerCNN(nn.Module):
     def __init__(self, num_classes):
-        super(CNN_Model, self).__init__()
+        super(SkinCancerCNN, self).__init__()
 
-        self.conv1 = nn.Conv2d(4, 32, kernel_size=3, stride=1, padding=1)  # 4 channels (RGB + Vessel)
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.conv1 = nn.Conv2d(in_channels=6, out_channels=32, kernel_size=3, stride=1, padding=1)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
-        self.fc1 = nn.Linear(64 * 64 * 64, 128)  # Adjust based on input size
+        self.pool = nn.MaxPool2d(2, 2)
+
+        self.fc1 = nn.Linear(64 * 56 * 56, 128)
         self.fc2 = nn.Linear(128, num_classes)
 
     def forward(self, x):
         x = self.pool(torch.relu(self.conv1(x)))
         x = self.pool(torch.relu(self.conv2(x)))
-        x = x.view(x.size(0), -1)  # Flatten
+        x = x.view(x.size(0), -1)
         x = torch.relu(self.fc1(x))
         x = self.fc2(x)
         return x
 
-# -------------------------------
-# 3️⃣ Training & Evaluation
-# -------------------------------
+# Function to load dataset paths
+def load_data(image_dir, vessel_dir):
+    classes = sorted(os.listdir(image_dir))  # Folder names are labels
+    image_paths, vessel_paths, labels = [], [], []
+    label_map = {cls: idx for idx, cls in enumerate(classes)}
 
-def train_model(model, train_loader, num_classes, epochs=10):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
+    for cls in classes:
+        img_cls_path = os.path.join(image_dir, cls)
+        vessel_cls_path = os.path.join(vessel_dir, cls)  # Vessel images stored separately
 
+        for img in os.listdir(img_cls_path):
+            img_path = os.path.join(img_cls_path, img)
+            vessel_path = os.path.join(vessel_cls_path, img)  # Matching filename
+
+            if os.path.exists(vessel_path):  # Ensure vessel image exists
+                image_paths.append(img_path)
+                vessel_paths.append(vessel_path)
+                labels.append(label_map[cls])
+
+    return train_test_split(image_paths, vessel_paths, labels, test_size=0.2, stratify=labels, random_state=42), len(classes)
+
+# Train Model
+def train_model(image_dir, vessel_dir, epochs=10, batch_size=16):
+    (train_imgs, test_imgs, train_vessels, test_vessels, train_labels, test_labels), num_classes = load_data(image_dir, vessel_dir)
+
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor()
+    ])
+
+    train_dataset = SkinCancerDataset(train_imgs, train_vessels, train_labels, transform)
+    test_dataset = SkinCancerDataset(test_imgs, test_vessels, test_labels, transform)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+    model = SkinCancerCNN(num_classes)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001)
 
     for epoch in range(epochs):
         model.train()
-        running_loss = 0.0
-        for images, labels in train_loader:
-            images = images.to(device)
-            labels = torch.tensor([class_to_idx[lbl] for lbl in labels]).to(device)  # Encode labels
+        total_loss = 0
 
+        for images, labels in train_loader:
             optimizer.zero_grad()
             outputs = model(images)
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
+            total_loss += loss.item()
 
-            running_loss += loss.item()
-        
-        print(f"Epoch [{epoch+1}/{epochs}], Loss: {running_loss:.4f}")
+        print(f"Epoch [{epoch+1}/{epochs}], Loss: {total_loss:.4f}")
 
-    return model
+    return model, test_loader
 
-# -------------------------------
-# 4️⃣ Main Execution
-# -------------------------------
+# Evaluate Model
+def evaluate_model(model, test_loader):
+    model.eval()
+    correct, total = 0, 0
 
-if __name__ == "__main__":
-    img_dir = "/path/to/skin_lesions/"  # Update with your dataset path
+    with torch.no_grad():
+        for images, labels in test_loader:
+            outputs = model(images)
+            _, predicted = torch.max(outputs, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
 
-    # Define transformations
-    transform = transforms.Compose([
-        transforms.Resize((128, 128)),
-        transforms.ToTensor(),
-    ])
-
-    dataset = SkinLesionDataset(img_dir, transform=transform)
-    
-    # Encode class labels
-    class_names = list(set(dataset.labels))
-    class_to_idx = {cls: idx for idx, cls in enumerate(class_names)}
-    num_classes = len(class_names)
-
-    train_loader = DataLoader(dataset, batch_size=32, shuffle=True)
-
-    model = CNN_Model(num_classes=num_classes)
-    model = train_model(model, train_loader, num_classes)
+    accuracy = 100 * correct / total
+    print(f"Test Accuracy: {accuracy:.2f}%")
